@@ -49,3 +49,5 @@ results.tsv
 # MLX
 mlx_model/
 *.safetensors
+*.log
+random_agent.py

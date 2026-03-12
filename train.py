@@ -43,8 +43,8 @@ def apply_rope(x, cos, sin):
 # Core Layers
 # ---------------------------------------------------------------------------
 
-class SwiGLU(nn.Module):
-    """Qwen uses SwiGLU instead of standard MLP."""
+class GeGLU(nn.Module):
+    """Experiment: Swap SwiGLU to GeGLU."""
     def __init__(self, config):
         super().__init__()
         # Hidden size is usually 8/3 of the embedding size in Qwen
@@ -54,7 +54,7 @@ class SwiGLU(nn.Module):
         self.down_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
 
     def __call__(self, x):
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(nn.gelu(self.gate_proj(x)) * self.up_proj(x))
 
 def chunkwise_linear_attention(q: mx.array, k: mx.array, v: mx.array, chunk_size: int = 128):
     """
@@ -211,7 +211,7 @@ class Block(nn.Module):
         else:
             self.attn = GatedLinearAttention(config)
             
-        self.mlp = SwiGLU(config)
+        self.mlp = GeGLU(config)
         self.ln1 = nn.RMSNorm(config.n_embd, eps=config.rms_norm_eps)
         self.ln2 = nn.RMSNorm(config.n_embd, eps=config.rms_norm_eps)
 
@@ -277,7 +277,8 @@ class MuonAdamW(optim.Optimizer):
         betas: tuple = (0.9, 0.95),
         weight_decay: float = 0.01,
         ns_steps: int = 5,
-        eps: float = 1e-8
+        eps: float = 1e-8,
+        vocab_size: int = 8192
     ):
         super().__init__()
         self.learning_rate = learning_rate
@@ -287,6 +288,7 @@ class MuonAdamW(optim.Optimizer):
         self.weight_decay = weight_decay
         self.ns_steps = ns_steps
         self.eps = eps
+        self.vocab_size = vocab_size
 
     @property
     def get_muon_lr(self):
@@ -297,7 +299,8 @@ class MuonAdamW(optim.Optimizer):
         return self.learning_rate(self.state["step"]) if callable(self.learning_rate) else self.learning_rate
 
     def init_single(self, parameter: mx.array, state: dict):
-        if parameter.ndim >= 2 and parameter.shape[0] != 8192 and parameter.shape[1] != 8192:
+        # Isolate internal MLP/Attention matrices for Muon
+        if parameter.ndim >= 2 and parameter.shape[0] != self.vocab_size and parameter.shape[1] != self.vocab_size:
             state["momentum_buffer"] = mx.zeros_like(parameter)
         else:
             state["m"] = mx.zeros_like(parameter)
@@ -305,8 +308,7 @@ class MuonAdamW(optim.Optimizer):
             state["step"] = mx.array(0, dtype=mx.uint32)
 
     def apply_single(self, gradient: mx.array, parameter: mx.array, state: dict):
-        # Isolate internal MLP/Attention matrices for Muon, leaving Embeddings to AdamW
-        if parameter.ndim >= 2 and parameter.shape[0] != 8192 and parameter.shape[1] != 8192:
+        if parameter.ndim >= 2 and parameter.shape[0] != self.vocab_size and parameter.shape[1] != self.vocab_size:
             # ----------------- MUON PATH -----------------
             lr = self.get_muon_lr
             lr = lr.astype(gradient.dtype) if hasattr(lr, 'astype') else mx.array(lr, dtype=gradient.dtype)
@@ -382,18 +384,19 @@ def loss_fn_eval(model, x, y):
 # ---------------------------------------------------------------------------
 
 DEVICE_BATCH_SIZE = 1
+TOTAL_BATCH_SIZE = 2**14 # ~16K tokens per optimizer step for stability
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 
-# True Qwen3.5-0.8B specs
+# Base Configuration: Optimized for stability across all Apple Silicon (160M parameters)
 config = QwenConfig(
     sequence_len=MAX_SEQ_LEN, 
     vocab_size=vocab_size,
-    n_layer=24, 
-    n_head=12, 
-    n_kv_head=4, 
-    n_embd=1536
+    n_layer=12, 
+    n_head=8, 
+    n_kv_head=2, 
+    n_embd=1024
 )
 
 model = QwenHybrid(config)
@@ -421,7 +424,7 @@ total_params = count_params(model.parameters())
 print(f"Model Architecture: Qwen3.5 Hybrid (3:1 Linear/Full)")
 print(f"Total Parameters:   {total_params / 1e6:.1f}M")
 
-optimizer = MuonAdamW(learning_rate=0.0003, muon_lr=0.02)
+optimizer = MuonAdamW(learning_rate=0.0001, muon_lr=0.02, vocab_size=vocab_size)
 loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
 @mx.compile
@@ -434,27 +437,66 @@ def step(x, y):
 # ---------------------------------------------------------------------------
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-print(f"Starting 5-minute training on MLX (No Shortcuts)...")
+print(f"Starting 5-minute training loop on MLX...")
+
+grad_accum_steps = max(1, TOTAL_BATCH_SIZE // (DEVICE_BATCH_SIZE * MAX_SEQ_LEN))
+print(f"Gradient accumulation steps: {grad_accum_steps}")
 
 t_start = time.time()
 step_count = 0
 total_training_time = 0
 
+def tree_map_add(t1, t2):
+    if isinstance(t1, dict):
+        return {k: tree_map_add(t1[k], t2[k]) for k in t1}
+    elif isinstance(t1, list):
+        return [tree_map_add(a, b) for a, b in zip(t1, t2)]
+    return t1 + t2
+
+def tree_map_div(t, n):
+    if isinstance(t, dict):
+        return {k: tree_map_div(v, n) for k, v in t.items()}
+    elif isinstance(t, list):
+        return [tree_map_div(v, n) for v in t]
+    return t / n
+
 while True:
     t0 = time.time()
-    x, y, epoch = next(train_loader)
     
-    loss, grads = step(x, y)
-    optimizer.update(model, grads)
-    mx.eval(model.parameters(), optimizer.state, loss) 
+    # Gradient Accumulation Loop
+    accum_grads = None
+    accum_loss = 0.0
+    
+    for _ in range(grad_accum_steps):
+        x, y, epoch = next(train_loader)
+        loss, grads = step(x, y)
+        accum_loss += loss
+        if accum_grads is None:
+            accum_grads = grads
+        else:
+            accum_grads = tree_map_add(accum_grads, grads)
+        
+        # Prevent OOM by evaluating the accumulated graph every micro-step
+        mx.eval(accum_loss, accum_grads)
+            
+    # Average and Update
+    accum_grads = tree_map_div(accum_grads, grad_accum_steps)
+    accum_loss = tree_map_div(accum_loss, grad_accum_steps)
+    
+    optimizer.update(model, accum_grads)
+    mx.eval(model.parameters(), optimizer.state, accum_loss) 
     
     dt = time.time() - t0
-    total_training_time += dt
+    
+    # Compilation Warmup: only count time after the first 5 compiled steps
+    if step_count > 5:
+        total_training_time += dt
+    
     step_count += 1
     
     if step_count % 1 == 0:
         progress = min(total_training_time / TIME_BUDGET, 1.0)
-        print(f"\rStep {step_count:04d} | Loss: {loss.item():.4f} | Progress: {progress*100:.1f}% | dt: {dt*1000:.0f}ms", end="")
+        print(f"\rStep {step_count:04d} | Loss: {accum_loss.item():.4f} | Progress: {progress*100:.1f}% | dt: {dt*1000:.0f}ms", end="")
 
     if total_training_time >= TIME_BUDGET:
         break
