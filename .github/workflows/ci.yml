@@ -1,0 +1,35 @@
+name: CI Smoke Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version-file: "pyproject.toml"
+
+    - name: Install dependencies
+      run: uv sync
+
+    - name: Syntax Check
+      run: |
+        uv run python -m py_compile prepare.py
+        uv run python -m py_compile train.py
+        
+    - name: MLX Import Check
+      run: uv run python -c "import mlx.core as mx; import mlx.nn as nn; print('MLX and its neural network modules installed successfully on macOS runner.')"
