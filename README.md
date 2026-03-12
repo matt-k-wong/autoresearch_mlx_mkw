@@ -1,6 +1,6 @@
 # Apple Mac OS X MLX Autoresearch
 
-A native Apple Silicon port of Andrej Karpathy's `autoresearch` project, heavily modified so it actually runs on edge hardware (like an M4 MacBook Air) without melting your unified memory.
+A native Apple Silicon port of Andrej Karpathy's [autoresearch](https://github.com/karpathy/autoresearch) project, heavily modified so it actually runs on edge hardware (like an M4 MacBook Air) without melting your unified memory.
 
 *Built with the help of Gemini 3.1 Pro (via the Gemini CLI).*
 
